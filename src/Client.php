@@ -2,12 +2,14 @@
 
 namespace Faktory;
 
-use Faktory\Exception\NotConnectedException;
-use Faktory\Exception\BadResponseException;
-use Faktory\Exception\UnsupportedProtocolException;
-use Faktory\Exception\WriteFailedException;
 use Psr\Log\LoggerAwareInterface;
 use Psr\Log\LoggerInterface;
+
+use Faktory\Exception\BadResponseException;
+use Faktory\Exception\CommandException;
+use Faktory\Exception\NotConnectedException;
+use Faktory\Exception\ParseException;
+use Faktory\Exception\UnsupportedProtocolException;
 
 class Client implements LoggerAwareInterface
 {
@@ -26,122 +28,122 @@ class Client implements LoggerAwareInterface
 	 */
 	private $logger;
 
-	public function __construct(array $params, array $options = array())
+	public function __construct(array $params, LoggerInterface $logger, array $options = array())
 	{
 		$this->params = array_merge($params, $options);
 		$this->stream = null;
+		$this->logger = $logger;
+		$this->open();
 	}
 
 	public function __destruct()
 	{
-		if (isset($this->params['persistent']) && $this->params['persistent']) {
-			return;
-		}
-		$this->disconnect();
+		$this->close();
+	}
+
+	/**
+	 * Use TLS connection?.
+	 *
+	 * @return boolean $use
+	 */
+	public function tls($url)
+	{
+		// Support TLS with this convention: "tcp+tls://:password@myhostname:port/"
+		return preg_match('/tls/', $url);
 	}
 
 	/**
 	 * Opens the connection to Faktory.
 	 */
-	public function connect()
+	public function open()
 	{
-		if (!is_null($this->stream)) {
-			return $this->stream;
+		$this->log('open','debug');
+		if (array_key_exists('url', $this->params)) {
+			$url = $this->params['url'];
 		} else {
-			if (array_key_exists('url', $this->params)) {
-				$url = $this->params['url'];
-			} else {
-				$scheme = array_key_exists('scheme', $this->params) ? $this->params['scheme'] : 'tcp';
-				$host = array_key_exists('host', $this->params) ? $this->params['host'] : '127.0.0.1';
-				$port = array_key_exists('port', $this->params) ? $this->params['port'] : 7419;
-				$url = $scheme. '://' . $host . ':' . $port;
-			}
+			$scheme = array_key_exists('scheme', $this->params) ? $this->params['scheme'] : 'tcp';
+			$host = array_key_exists('host', $this->params) ? $this->params['host'] : '127.0.0.1';
+			$port = array_key_exists('port', $this->params) ? $this->params['port'] : 7419;
+			$url = $scheme. '://' . $host . ':' . $port;
+		}
+		if ($this->tls($url)) {
+		} else {
 			$stream = stream_socket_client($url, $errno, $errstr);
-			if (!$stream) {
-				throw new NotConnectedException;
-			}
-			$this->stream = $stream;
-			$this->handshake();
 		}
-		return $this->stream;
-	}
-
-	/**
-	 * Closes the connection to Faktory.
-	 */
-	public function disconnect()
-	{
-		if (!is_null($this->stream)) {
-			fclose($this->stream);
+		if (!$stream) {
+			throw new NotConnectedException;
 		}
-		$this->stream = null;
-	}
+		$this->stream = $stream;
 
-	/**
-	 * Checks if the connection to Faktory is considered open.
-	 *
-	 * @return bool
-	 */
-	public function isConnected()
-	{
-		return !is_null($this->stream);
-	}
-
-	/**
-	 * Initial handshake.
-	 */
-	public function handshake()
-	{
-		$response = $this->readResponse();
-		$this->log('hello: from server: '.$response, 'debug');
-		if (!preg_match('/HI\s/', $response)) {
-			throw new BadResponseException('expected HI, got: '.$response);
+		$resp = $this->result();
+		$this->log('hello: from server: '.$resp, 'debug');
+		if (!preg_match('/\AHI (.*)/', $resp)) {
+			throw new BadResponseException('expected HI, got: '.$resp);
 		}
-		$server = json_decode(trim(substr($response, 3)), true);
+		$server = json_decode(trim(substr($resp, 3)), true);
 		$this->log('server: '.json_encode($server), 'debug');
 
 		$version = array_key_exists('v', $server) ? $server['v'] : -1;
-		$nonce = array_key_exists('s', $server) ? $server['s'] : '';
+		$salt = array_key_exists('s', $server) ? $server['s'] : '';
 		$iter = array_key_exists('i', $server) ? $server['i'] : 0;
 		$this->log('version: '.$version, 'debug');
-		$this->log('nonce: '.$nonce, 'debug');
+		$this->log('salt: '.$salt, 'debug');
 		$this->log('iters: '.$iter, 'debug');
 
 		if ($version !== 2) {
 			throw new UnsupportedProtocolException('version: '.$version);
 		}
 
-		$hello = array(
+		$payload = array(
 			'hostname' => gethostname(),
 			'pid' => getmypid(),
 			'labels' => array('php'),
 			'v' => $version
 		);
 
-		if (!empty($nonce) || !empty($iter)) {
-			$hello['pwdhash'] = $this->passwordHash($nonce, $iter);
+		if (!empty($salt) || !empty($iter)) {
+			$password = array_key_exists('password', $this->params) ? $this->params['password'] : null;
+			if (empty($password)) {
+				throw new NotConnectedException('password required');
+			}
+			$payload['pwdhash'] = $this->hasher($iter, $password, $salt);
 		}
 
 		$wid = array_key_exists('wid', $this->params) ? $this->params['wid'] : null;
 		if (!empty($wid)) {
-			$hello['wid'] = $wid;
+			$payload['wid'] = $wid;
 		}
 
-		$response = $this->executeCommand('HELLO', $hello);
-		if ($response !== "OK") {
-			throw new BadResponseException('expected OK, got: '.$response);
+		$this->command('HELLO', json_encode($payload));
+		$this->ok();
+
+	}
+
+	/**
+	 * Closes the connection to Faktory.
+	 */
+	public function close()
+	{
+		$this->log('close','debug');
+		if (is_null($this->stream)) {
+			return;
 		}
+		$this->command('END');
+		fclose($this->stream);
+		$this->stream = null;
 	}
 
 	/**
 	 * Calculate password hash.
 	 *
+	 * @param int $iter
+	 * @param int $password
+	 * @param int $salt
 	 * @return string hash
 	 */
-	private function passwordHash($nonce, $iter)
+	private function hasher($iter, $password, $salt)
 	{
-		$password = array_key_exists('password', $this->params) ? $this->params['password'] : '';
-		$data = $password . $nonce;
+		$data = $password . $salt;
 		for ($i=0; $i < $iter; $i++) {
 			$data = hash('sha256', $data, true);
 		}
@@ -149,169 +151,222 @@ class Client implements LoggerAwareInterface
 	}
 
 	/**
-	 * Writes the request for the given command over the connection.
+	 * Writes a comand string to Faktory server.
 	 *
-	 * @param string $command Command.
-	 * @param mixed $data Data.
+	 * @param strings $args Command and args.
 	 *
 	 * @return
 	 */
-	public function writeRequest($command, $data)
+	public function command(...$args)
 	{
-		if (!$this->connect()) {
-			throw new NotConnectedException;
-		}
-		$buffer = $command . ' ' . (is_string($data) ? $data : json_encode($data)) . "\r\n";
-		$length = strlen($buffer);
-		$written = fwrite($this->stream, $buffer, strlen($buffer));
-		if ($written !== $length) {
-			throw new WriteFailedException;
-		}
-		$this->log('write: '.$buffer, 'debug');
+		$cmd = join(' ', $args);
+		$n = fwrite($this->stream, $cmd . "\r\n", strlen($cmd)+2);
+		$this->log('command: '.$cmd.' ('.$n.')', 'debug');
 		return true;
 	}
 
 	/**
-	 * Reads the response from Factory.
+	 * Read result back from Faktory server.
 	 *
-	 * @return string
+	 * I love pragmatic, simple protocols.  Thanks antirez!
+	 * https://redis.io/topics/protocol
+	 *
+	 * @return string $result
 	 */
-	public function readResponse(int $length = 1024)
+	public function result(int $length = 1024)
 	{
-		if (!$this->connect()) {
-			throw new NotConnectedException;
-		}
-		$bytes = fread($this->stream, $length);
-		//$this->log('read: bytes: '.$bytes, 'debug');
-
-		while (strpos($bytes, "\r\n") === false) {
-			$bytes .= fread($this->stream, $length - strlen($bytes));
-			//$this->log('read: bytes: '.$bytes, 'debug');
+		$line = fgets($this->stream, $length);
+		$this->log('line: '.$line.' ('.(empty($line) ? '': strlen($line)).')', 'debug');
+		if (empty($line)) {
+			throw new BadResponseException;
 		}
 
-		$char = $bytes[0];
-		if ($char === '$') {
-			//$this->log('read: $', 'debug');
-			$count = (int)substr($bytes, 1);
-			//$this->log('read: count: '.$count, 'debug');
-			if ($count > 0) {
-				$offset = strlen($count) + 3;
-				//$this->log('read: offset: '.$offset, 'debug');
-				$response = substr($bytes, $offset);
-				$this->log('read: response: '.$response, 'debug');
-				return $response;
+		$chr = $line[0];
+		if ($chr === '+') {
+			$result = trim(substr($line, 1, strpos($line, "\r\n")));
+			$this->log('result: '.$result, 'debug');
+			return $result;
+		} elseif ($chr === '$') {
+			$count = (int)trim(substr($line, 1, strpos($line, "\r\n")));
+			if ($count === -1) {
+				$this->log('result: <NULL>', 'debug');
+				return null;
+			} elseif ($count > 0) {
+				$result = fgets($this->stream, $count);
+				$waste = fgets($this->stream, $length); // read extra linefeeds
+				$this->log('result: '.$result, 'debug');
+				return $result;
 			} else {
-				$response = '';
-				$this->log('read: response: '.$response, 'debug');
-				return $response;
+				$this->log('result: <NULL>', 'debug');
+				return null;
 			}
-		} elseif ($char === '-' || $char === '+') {
-			$response = trim(substr($bytes, 1, strpos($bytes, "\r\n")));
-			$this->log('read: response: '.$response, 'debug');
-			return $response;
-		}
-		return null;
-	}
-
-	/**
-	 * Writes a request for the given command over the connection and reads back
-	 * the response returned by Facktory.
-	 *
-	 * @param string $command Command.
-	 * @param mixed $data Data.
-	 *
-	 * @return mixed
-	 */
-	public function executeCommand($command, $data)
-	{
-		if (!$this->connect()) {
-			throw new NotConnectedException;
-		}
-		$this->writeRequest($command, $data);
-		return $this->readResponse();
-	}
-
-	private function trim($response)
-	{
-		return trim(substr($response, 0, strpos($response, "\r\n")));
-	}
-
-	/**
-	 * Initial handshake.
-	 */
-	public function heartbeat(string $wid)
-	{
-		if (!$this->connect()) {
-			throw new NotConnectedException;
-		}
-		$response = $this->executeCommand('BEAT', array('wid' => $wid));
-		if ($response !== "OK") {
-			return 'OK';
+		} elseif ($chr === '-') {
+			throw new CommandException;
 		} else {
-			$status = json_decode($response, true);
-			if (array_key_exists('state', $status)) {
-				$state = $status['state'];
-				return strtoupper($state);
-			}
+			$result = trim(substr($line, 1, strpos($line, "\r\n")));
+			throw new ParseException($result);
 		}
-		return 'NOT_OK';
+
 	}
 
+	/**
+	 * Read result back from Faktory server and assert it is OK.
+	 *
+	 * @return boolean $ok
+	 */
+	public function ok()
+	{
+		$resp = $this->result();
+		if ($resp !== 'OK') {
+			throw new CommandException;
+		}
+		return true;
+	}
+
+	/**
+	 * Attempt resilent transaction (re-open connection if lost)
+	 *
+	 * @param callable $callback
+	 * @return mixed $return
+	 */
+	public function transaction(callable $callback)
+	{
+		$return = null;
+		$retryable = true;
+
+    while ($retryable) {
+			try {
+				$return = $callback();
+		    $retryable = false;
+			} catch (Exception $e) {
+				$this->logger->alert('Transaction failure {exception}', array(
+					'exception' => $e
+				));
+				if ($retryable) {
+					$this->logger->alert('Retrying...');
+					$this->open();
+				}
+			}
+		}
+		return $return;
+	}
+
+	/**
+	 * Warning: this clears all job data in Faktory.
+	 */
+	public function flush()
+	{
+		$self = $this;
+		return $this->transaction(function () use (&$self) {
+			$self->command('FLUSH');
+			$self->ok();
+		});
+	}
+
+	/**
+	 * Push a job to Faktory.
+	 *
+	 * @param Job $job
+	 * @return string $jid
+	 */
 	public function push(Job $job) : string
 	{
-		if (!$this->connect()) {
-			throw new NotConnectedException;
-		}
-		$response = $this->executeCommand('PUSH', json_encode($job));
-		if ($response !== "OK") {
-			throw new BadResponseException('expected OK, got: '.$response);
-		}
-		return $job->getId();
+		$self = $this;
+		return $this->transaction(function () use (&$self, $job) {
+			$self->command('PUSH', json_encode($job));
+			$self->ok();
+			return $job->getId();
+		});
 	}
 
+	/**
+	 * Fetch a job from Faktory.
+	 *
+	 * @param array $queues
+	 * @return array $job
+	 */
 	public function fetch(array $queues)
 	{
-		if (!$this->connect()) {
-			throw new NotConnectedException;
-		}
-		$response = $this->executeCommand('FETCH', implode(' ', $queues));
-		return empty($response) ? null : json_decode($response);
+		$self = $this;
+		return $this->transaction(function () use (&$self, $queues) {
+			$self->command('FETCH', implode(' ', $queues));
+			$resp = $this->result();
+			return empty($resp) ? null : json_decode($resp);
+		});
 	}
 
-	public function ack(string $jobId) : void
+	/**
+	 * Acknowledge job as completed in Faktory.
+	 *
+	 * @param string $jid Job ID
+	 */
+	public function ack(string $jid) : void
 	{
-		if (!$this->connect()) {
-			throw new NotConnectedException;
-		}
-		$job = new Job();
-		$job->id($jobId);
-		$response = $this->executeCommand('ACK', json_encode($job));
-		if ($response !== "OK") {
-			throw new BadResponseException('expected OK, got: '.$response);
-		}
+		$self = $this;
+		$this->transaction(function () use (&$self, $jid) {
+			$self->command('ACK', '{"jid":"'.$jid.'"}');
+			$self->ok();
+		});
 	}
 
-	public function fail(string $jobId) : void
+	/**
+	 * Mark job as failed in Faktory.
+	 *
+	 * @param string $jid Job ID
+	 * @param Exception $ex
+	 */
+	public function fail(string $jid, \Exception $ex) : void
 	{
-		if (!$this->connect()) {
-			throw new NotConnectedException;
-		}
-		$job = new Job();
-		$job->id($jobId);
-		$response = $this->executeCommand('FAIL', json_encode($job));
-		if ($response !== "OK") {
-			throw new BadResponseException('expected OK, got: '.$response);
-		}
+		$self = $this;
+		$this->transaction(function () use (&$self, $jid, $ex) {
+			$payload = array(
+				'jid' => $jid,
+				'message' => substr($ex->getMessage(), 0, 1000),
+				'backtrace' => $ex->getTrace()
+			);
+			$self->command('FAIL', json_encode($payload));
+			$self->ok();
+		});
 	}
 
+
+	/**
+	 * Send heart beat to Faktory.
+	 *
+	 * @param string $wid Worker ID
+	 * @return array $state
+	 */
+	public function beat(string $wid)
+	{
+		$self = $this;
+		return $this->transaction(function () use (&$self, $wid) {
+			$self->command('BEAT', '{"wid":"'.$wid.'"}');
+			$resp = $this->result();
+			if ($resp !== "OK") {
+				$self->log('beat: '.$resp, 'debug');
+				return $resp;
+			} else {
+				$hash = json_decode($resp, true);
+				$self->log('beat: state: '.$hash['state'], 'debug');
+				return $hash['state'];
+			}
+		});
+	}
+
+	/**
+	 * Get info from Faktory
+	 *
+	 * @return array $info
+	 */
 	public function info()
 	{
-		if (!$this->connect()) {
-			throw new NotConnectedException;
-		}
-		$response = $this->executeCommand('INFO', '');
-		$this->log('info: '.$response, 'debug');
-		return json_decode($response);
+		$self = $this;
+		return $this->transaction(function () use (&$self) {
+			$self->command('INFO');
+			$resp = $this->result();
+			$self->log('info: '.$resp, 'debug');
+			return !empty($resp) ? json_decode($resp, true) : null;
+		});
 	}
 
 	/**
