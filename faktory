@@ -1,0 +1,47 @@
+#!/usr/bin/env php
+<?php
+
+require_once '../psr/autoloader.php';
+require_once './autoloader.php';
+
+$config = array(
+  'host' => '127.0.0.1',
+  'port' => 7419
+);
+
+$logger = new \Faktory\Logger();
+$logger->ansi(true);
+$client = new \Faktory\Client($config);
+$client->setLogger($logger);
+
+$queue = 'default';
+$class = 'DebugJob';
+$args = array('model' => 'Form');
+
+if (!is_array($args)) {
+  $args = [$args];
+}
+$id = md5(uniqid('', true));
+$job = new \Faktory\Job($class, $args);
+$job->queue('hooks');
+$job->custom(array('lang' => 'en'));
+//$job->at(new DateTime('2018-11-18 13:21:49'));
+$id = $client->push($job);
+if (defined('DEBUG_BACKTRACE_IGNORE_ARGS')) {
+  $caller = version_compare(PHP_VERSION, '5.4.0') >= 0
+    ? debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 1)
+    : debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS);
+} else {
+  $caller = debug_backtrace();
+}
+$logger->log('debug','queue: {queue}, class: {class}, args: {args}, jobId: {jobId}, caller: {caller}', array(
+  'queue'  => $queue,
+  'class'  => $class,
+  'args'   => json_encode($args),
+  'jobId'  => $id,
+  'caller' => json_encode($caller)
+));
+
+$job = $client->fetch(array('hooks'));
+$info = $client->info();
+
